@@ -2,8 +2,6 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ExtractedFont } from '../src/types/font.ts';
 
-const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-4-hydrogen'];
-
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -24,10 +22,6 @@ function isTransientDemandError(err: unknown): boolean {
     text.includes('429') ||
     text.includes('RESOURCE_EXHAUSTED')
   );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export default async function handler(
@@ -75,7 +69,8 @@ export default async function handler(
       '',
     );
 
-    const requestPayload = {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
       contents: {
         parts: [
           {
@@ -134,38 +129,7 @@ export default async function handler(
           required: ['matches'],
         },
       },
-    };
-
-    let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null =
-      null;
-    let lastErr: unknown = null;
-
-    // Try primary model with a quick retry, then fall back to the secondary model
-    for (const model of CANDIDATE_MODELS) {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          response = await ai.models.generateContent({
-            model,
-            ...requestPayload,
-          });
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          if (!isTransientDemandError(err)) {
-            throw err;
-          }
-          if (attempt < 2) {
-            await sleep(700 * attempt);
-          }
-        }
-      }
-      if (response) break;
-    }
-
-    if (!response) {
-      throw lastErr ?? new Error('All candidate models are temporarily busy.');
-    }
+    });
 
     const rawText = (response.text ?? '{}').trim();
     const parsed = JSON.parse(rawText) as {
@@ -237,7 +201,7 @@ export default async function handler(
     if (isTransientDemandError(err)) {
       res.status(503).json({
         error:
-          'The font-matching model is currently experiencing high demand. Please wait a few seconds and try again.',
+          'The font-matching model is temporarily busy. Please try again in a few seconds.',
       });
       return;
     }
