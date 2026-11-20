@@ -1,0 +1,6 @@
+{
+  "name": "FontExtractor",
+  "description": "Instantly identify and extract fonts from any live website URL or uploaded image—100% free with zero login required.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
