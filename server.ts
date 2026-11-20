@@ -239,4 +239,9 @@ async function startServer() {
   });
 }
 
-startServer();
+export { app };
+
+// Only start an HTTP/Vite server when running directly (local / AI Studio), not on Vercel
+if (!process.env.VERCEL) {
+  startServer();
+}
