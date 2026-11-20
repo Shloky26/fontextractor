@@ -2,6 +2,8 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ExtractedFont } from '../src/types/font.ts';
 
+const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-4-hydrogen'];
+
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -10,13 +12,35 @@ function getGeminiClient(): GoogleGenAI | null {
   return new GoogleGenAI({ apiKey });
 }
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+function isTransientDemandError(err: unknown): boolean {
+  const text =
+    err instanceof Error
+      ? `${err.message} ${JSON.stringify(err)}`
+      : String(err ?? '');
+  return (
+    text.includes('503') ||
+    text.includes('UNAVAILABLE') ||
+    text.includes('high demand') ||
+    text.includes('429') ||
+    text.includes('RESOURCE_EXHAUSTED')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export default async function handler(
+  req: VercelRequest,
+  res: VercelResponse,
+) {
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
+    res.status(405).json({ error: 'Method not allowed. Use POST.' });
     return;
   }
 
   const startedAt = Date.now();
+
   try {
     const { imageBase64, mimeType, fileName } = (req.body || {}) as {
       imageBase64?: string;
@@ -31,7 +55,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const allowedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
     if (!allowedMimeTypes.has(mimeType)) {
-      res.status(400).json({ error: 'Only PNG, JPG, and WEBP images are supported.' });
+      res
+        .status(400)
+        .json({ error: 'Only PNG, JPG, and WEBP images are supported.' });
       return;
     }
 
@@ -44,10 +70,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const cleanBase64 = imageBase64.replace(
+      /^data:image\/[a-zA-Z0-9.+-]+;base64,/,
+      '',
+    );
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+    const requestPayload = {
       contents: {
         parts: [
           {
@@ -106,7 +134,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           required: ['matches'],
         },
       },
-    });
+    };
+
+    let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null =
+      null;
+    let lastErr: unknown = null;
+
+    // Try primary model with a quick retry, then fall back to the secondary model
+    for (const model of CANDIDATE_MODELS) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model,
+            ...requestPayload,
+          });
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (!isTransientDemandError(err)) {
+            throw err;
+          }
+          if (attempt < 2) {
+            await sleep(700 * attempt);
+          }
+        }
+      }
+      if (response) break;
+    }
+
+    if (!response) {
+      throw lastErr ?? new Error('All candidate models are temporarily busy.');
+    }
 
     const rawText = (response.text ?? '{}').trim();
     const parsed = JSON.parse(rawText) as {
@@ -175,6 +234,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       fonts,
     });
   } catch (err) {
+    if (isTransientDemandError(err)) {
+      res.status(503).json({
+        error:
+          'The font-matching model is currently experiencing high demand. Please wait a few seconds and try again.',
+      });
+      return;
+    }
+
     const message =
       err instanceof Error
         ? err.message
