@@ -2,6 +2,12 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ExtractedFont } from '../src/types/font.ts';
 
+const MODEL_CANDIDATES = [
+  'gemini-3.8-flash',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+];
+
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -22,6 +28,87 @@ function isTransientDemandError(err: unknown): boolean {
     text.includes('429') ||
     text.includes('RESOURCE_EXHAUSTED')
   );
+}
+
+async function generateFontMatchWithFallback(
+  ai: GoogleGenAI,
+  cleanBase64: string,
+  mimeType: string,
+) {
+  const requestPayload = {
+    contents: {
+      parts: [
+        {
+          inlineData: {
+            mimeType,
+            data: cleanBase64,
+          },
+        },
+        {
+          text: `Inspect all prominent typography visible in this image. Identify up to 3 distinct typefaces or closest matching web/foundry fonts (such as Playfair Display, Fraunces, Plus Jakarta Sans, DM Sans, Barlow Condensed, JetBrains Mono, IBM Plex Mono, Helvetica Neue, Futura, Garamond, Bodoni Moda, Oswald, Outfit, Syne). For each detected font, determine its role (Primary Heading, Body Copy, Monospace / Code, Display / Accent), confidence score (72 to 98), classification, observed weights, style, fallback stack, a short phrase from the image using that font, and concise letterform geometry notes (e.g. x-height, terminal shape, stroke contrast).`,
+        },
+      ],
+    },
+    config: {
+      systemInstruction:
+        'You are a senior typographer and font identification engine. Analyze letterform geometry accurately and return concise structured JSON with real typeface matches.',
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          matches: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                family: { type: Type.STRING },
+                role: { type: Type.STRING },
+                confidence: { type: Type.INTEGER },
+                classification: { type: Type.STRING },
+                weights: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                styles: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                fallbackStack: { type: Type.STRING },
+                observedSample: { type: Type.STRING },
+                letterformNotes: { type: Type.STRING },
+              },
+              required: [
+                'family',
+                'role',
+                'confidence',
+                'classification',
+                'weights',
+                'styles',
+                'fallbackStack',
+                'observedSample',
+                'letterformNotes',
+              ],
+            },
+          },
+        },
+        required: ['matches'],
+      },
+    },
+  };
+
+  let lastError: unknown;
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      return await ai.models.generateContent({
+        model,
+        ...requestPayload,
+      });
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError;
 }
 
 export default async function handler(
@@ -69,67 +156,11 @@ export default async function handler(
       '',
     );
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType,
-              data: cleanBase64,
-            },
-          },
-          {
-            text: `Inspect all prominent typography visible in this image. Identify up to 3 distinct typefaces or closest matching web/foundry fonts (such as Playfair Display, Fraunces, Plus Jakarta Sans, DM Sans, Barlow Condensed, JetBrains Mono, IBM Plex Mono, Helvetica Neue, Futura, Garamond, Bodoni Moda, Oswald, Outfit, Syne). For each detected font, determine its role (Primary Heading, Body Copy, Monospace / Code, Display / Accent), confidence score (72 to 98), classification, observed weights, style, fallback stack, a short phrase from the image using that font, and concise letterform geometry notes (e.g. x-height, terminal shape, stroke contrast).`,
-          },
-        ],
-      },
-      config: {
-        systemInstruction:
-          'You are a senior typographer and font identification engine. Analyze letterform geometry accurately and return concise structured JSON with real typeface matches.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            matches: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  family: { type: Type.STRING },
-                  role: { type: Type.STRING },
-                  confidence: { type: Type.INTEGER },
-                  classification: { type: Type.STRING },
-                  weights: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  styles: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  fallbackStack: { type: Type.STRING },
-                  observedSample: { type: Type.STRING },
-                  letterformNotes: { type: Type.STRING },
-                },
-                required: [
-                  'family',
-                  'role',
-                  'confidence',
-                  'classification',
-                  'weights',
-                  'styles',
-                  'fallbackStack',
-                  'observedSample',
-                  'letterformNotes',
-                ],
-              },
-            },
-          },
-          required: ['matches'],
-        },
-      },
-    });
+    const response = await generateFontMatchWithFallback(
+      ai,
+      cleanBase64,
+      mimeType,
+    );
 
     const rawText = (response.text ?? '{}').trim();
     const parsed = JSON.parse(rawText) as {
