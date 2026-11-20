@@ -2,11 +2,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { ExtractedFont } from '../src/types/font.ts';
 
-const MODEL_CANDIDATES = [
-  'gemini-3.8-flash',
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
-];
+const MODEL_CANDIDATES = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
 
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
