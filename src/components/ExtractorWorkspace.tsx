@@ -28,6 +28,132 @@ interface LoadedImagePreview {
   dimensions?: string;
 }
 
+const REQUEST_TIMEOUT_MS = 25_000;
+const IMAGE_REQUEST_TIMEOUT_MS = 50_000;
+const MAX_UPLOAD_DIMENSION = 1024;
+const JPEG_QUALITY = 0.8;
+const HIGH_DEMAND_MESSAGE =
+  'The font-matching model is currently experiencing high demand. Please wait a moment and try again.';
+
+async function compressImageForUpload(
+  dataUrl: string,
+  maxDimension = MAX_UPLOAD_DIMENSION,
+  quality = JPEG_QUALITY,
+): Promise<{ dataUrl: string; mimeType: 'image/jpeg' }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const srcWidth = img.naturalWidth || img.width;
+      const srcHeight = img.naturalHeight || img.height;
+      if (!srcWidth || !srcHeight) {
+        reject(new Error('Could not read image dimensions.'));
+        return;
+      }
+
+      const largest = Math.max(srcWidth, srcHeight);
+      const scale = largest > maxDimension ? maxDimension / largest : 1;
+      const targetWidth = Math.max(1, Math.round(srcWidth * scale));
+      const targetHeight = Math.max(1, Math.round(srcHeight * scale));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        reject(new Error('Canvas 2D context is unavailable.'));
+        return;
+      }
+
+      // Fill white backdrop before JPEG encoding so transparent PNGs stay crisp
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+      const compressedDataUrl = canvas.toDataURL('image/jpeg', quality);
+      resolve({
+        dataUrl: compressedDataUrl,
+        mimeType: 'image/jpeg',
+      });
+    };
+    img.onerror = () => {
+      reject(new Error('Failed to decode image for compression.'));
+    };
+    img.src = dataUrl;
+  });
+}
+
+function unwrapJsonErrorString(input: string): { code?: number; message: string } {
+  let current = input.trim();
+  let code: number | undefined;
+
+  for (let depth = 0; depth < 4; depth++) {
+    const jsonStart = current.indexOf('{');
+    if (jsonStart === -1) break;
+    const jsonCandidate = current.slice(jsonStart);
+    try {
+      const parsed = JSON.parse(jsonCandidate) as {
+        error?: string | { code?: number; status?: string; message?: string };
+        message?: string;
+        code?: number;
+      };
+      if (typeof parsed.code === 'number') code = parsed.code;
+      if (typeof parsed.error === 'string') {
+        current = parsed.error.trim();
+        continue;
+      }
+      if (parsed.error && typeof parsed.error === 'object') {
+        if (typeof parsed.error.code === 'number') code = parsed.error.code;
+        if (typeof parsed.error.message === 'string') {
+          current = parsed.error.message.trim();
+          continue;
+        }
+      }
+      if (typeof parsed.message === 'string') {
+        current = parsed.message.trim();
+        continue;
+      }
+      break;
+    } catch {
+      break;
+    }
+  }
+
+  return { code, message: current };
+}
+
+function formatApiError(status: number, rawBody: string, fallback: string): string {
+  const { code, message } = unwrapJsonErrorString(rawBody);
+  const effectiveStatus = code ?? status;
+  const lower = message.toLowerCase();
+
+  if (lower.includes('gemini_api_key')) {
+    return message;
+  }
+
+  if (
+    effectiveStatus === 503 ||
+    lower.includes('503') ||
+    lower.includes('high demand') ||
+    lower.includes('unavailable') ||
+    lower.includes('overloaded')
+  ) {
+    return HIGH_DEMAND_MESSAGE;
+  }
+
+  if (effectiveStatus === 429 || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return 'Rate limit reached. Please wait a moment and try again.';
+  }
+
+  if (!message || message.startsWith('{') || message.startsWith('<')) {
+    return fallback;
+  }
+
+  return message;
+}
+
 export function ExtractorWorkspace({
   mode,
   onModeChange,
@@ -38,6 +164,8 @@ export function ExtractorWorkspace({
   const [loadedImage, setLoadedImage] = useState<LoadedImagePreview | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [loadingLabel, setLoadingLabel] = useState<string>('');
+  const [isImageRequestActive, setIsImageRequestActive] = useState<boolean>(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<ExtractionResult | null>(null);
   const [previewText, setPreviewText] = useState<string>(
@@ -47,6 +175,25 @@ export function ExtractorWorkspace({
   const [failedSampleThumbs, setFailedSampleThumbs] = useState<Record<string, boolean>>({});
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const abortReasonsRef = useRef(new WeakMap<AbortController, 'timeout' | 'cancelled'>());
+
+  const abortActiveRequest = useCallback(() => {
+    const current = activeControllerRef.current;
+    if (current) {
+      abortReasonsRef.current.set(current, 'cancelled');
+      current.abort();
+      activeControllerRef.current = null;
+    }
+    setIsImageRequestActive(false);
+    setElapsedSeconds(0);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      abortActiveRequest();
+    };
+  }, [abortActiveRequest]);
 
   const runUrlExtraction = useCallback(async (targetUrl: string) => {
     const trimmed = targetUrl.trim();
@@ -54,6 +201,14 @@ export function ExtractorWorkspace({
       setErrorMsg('Please enter a website URL to inspect (for example, https://tailwindcss.com).');
       return;
     }
+
+    abortActiveRequest();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    const timeoutId = window.setTimeout(() => {
+      abortReasonsRef.current.set(controller, 'timeout');
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
 
     setLoading(true);
     setLoadingLabel('Fetching HTML and linked stylesheets...');
@@ -65,69 +220,173 @@ export function ExtractorWorkspace({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: trimmed }),
+        signal: controller.signal,
       });
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'Could not extract fonts from this URL.');
+      const rawText = await response.text();
+      if (controller.signal.aborted || activeControllerRef.current !== controller) {
+        return;
       }
+
+      if (!response.ok) {
+        throw new Error(
+          formatApiError(response.status, rawText, 'Could not extract fonts from this URL.'),
+        );
+      }
+
+      const data = JSON.parse(rawText) as ExtractionResult;
       if (!data.fonts || data.fonts.length === 0) {
         throw new Error(
           'No explicit font declarations were found in accessible stylesheets for this page.',
         );
       }
 
-      setResult(data as ExtractionResult);
+      setResult(data);
     } catch (err) {
-      setErrorMsg(
-        err instanceof Error ? err.message : 'Unable to reach the target website.',
-      );
+      const isAbort =
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError') ||
+        controller.signal.aborted;
+
+      if (isAbort) {
+        if (
+          abortReasonsRef.current.get(controller) === 'timeout' &&
+          activeControllerRef.current === controller
+        ) {
+          setErrorMsg('The request timed out after 25 seconds. Please try again.');
+        }
+        return;
+      }
+
+      if (activeControllerRef.current === controller) {
+        setErrorMsg(
+          err instanceof Error ? err.message : 'Unable to reach the target website.',
+        );
+      }
     } finally {
-      setLoading(false);
-      setLoadingLabel('');
+      window.clearTimeout(timeoutId);
+      if (activeControllerRef.current === controller) {
+        activeControllerRef.current = null;
+        setLoading(false);
+        setLoadingLabel('');
+      }
     }
-  }, []);
+  }, [abortActiveRequest]);
 
   const runImageExtraction = useCallback(
     async (imagePayload: LoadedImagePreview) => {
+      abortActiveRequest();
+      const controller = new AbortController();
+      activeControllerRef.current = controller;
+
+      const startedAt = Date.now();
+      const timeoutId = window.setTimeout(() => {
+        abortReasonsRef.current.set(controller, 'timeout');
+        controller.abort();
+      }, IMAGE_REQUEST_TIMEOUT_MS);
+
+      const intervalId = window.setInterval(() => {
+        if (activeControllerRef.current === controller) {
+          const seconds = Math.min(
+            Math.round(IMAGE_REQUEST_TIMEOUT_MS / 1000),
+            Math.floor((Date.now() - startedAt) / 1000),
+          );
+          setElapsedSeconds(seconds);
+        }
+      }, 1000);
+
       setLoading(true);
-      setLoadingLabel('Analyzing letterforms, stroke contrast, and glyph geometry...');
+      setIsImageRequestActive(true);
+      setElapsedSeconds(0);
+      setLoadingLabel('Analyzing font geometry...');
       setErrorMsg(null);
       setResult(null);
 
       try {
+        const compressed = await compressImageForUpload(
+          imagePayload.dataUrl,
+          MAX_UPLOAD_DIMENSION,
+          JPEG_QUALITY,
+        );
+
+        if (controller.signal.aborted || activeControllerRef.current !== controller) {
+          return;
+        }
+
         const response = await fetch('/api/extract-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            imageBase64: imagePayload.dataUrl,
-            mimeType: imagePayload.mimeType,
+            imageBase64: compressed.dataUrl,
+            mimeType: compressed.mimeType,
             fileName: imagePayload.fileName,
           }),
+          signal: controller.signal,
         });
 
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || 'Could not identify fonts in this image.');
+        const rawText = await response.text();
+        if (controller.signal.aborted || activeControllerRef.current !== controller) {
+          return;
         }
 
-        setResult(data as ExtractionResult);
+        if (!response.ok) {
+          throw new Error(
+            formatApiError(
+              response.status,
+              rawText,
+              'Could not identify fonts in this image.',
+            ),
+          );
+        }
+
+        const data = JSON.parse(rawText) as ExtractionResult;
+        setResult(data);
       } catch (err) {
-        setErrorMsg(
-          err instanceof Error
-            ? err.message
-            : 'Unable to analyze typography in this image.',
-        );
+        const isAbort =
+          (err instanceof DOMException && err.name === 'AbortError') ||
+          (err instanceof Error && err.name === 'AbortError') ||
+          controller.signal.aborted;
+
+        if (isAbort) {
+          if (
+            abortReasonsRef.current.get(controller) === 'timeout' &&
+            activeControllerRef.current === controller
+          ) {
+            setErrorMsg('The request timed out after 50 seconds. Please try again.');
+          }
+          return;
+        }
+
+        if (activeControllerRef.current === controller) {
+          setErrorMsg(
+            err instanceof Error
+              ? formatApiError(500, err.message, 'Unable to analyze typography in this image.')
+              : 'Unable to analyze typography in this image.',
+          );
+        }
       } finally {
-        setLoading(false);
-        setLoadingLabel('');
+        window.clearInterval(intervalId);
+        window.clearTimeout(timeoutId);
+        if (activeControllerRef.current === controller) {
+          activeControllerRef.current = null;
+          setLoading(false);
+          setLoadingLabel('');
+          setIsImageRequestActive(false);
+          setElapsedSeconds(0);
+        }
       }
     },
-    [],
+    [abortActiveRequest],
   );
 
   const processImageFile = useCallback(
     (file: File) => {
+      abortActiveRequest();
+      setLoading(false);
+      setLoadingLabel('');
+      setErrorMsg(null);
+      setResult(null);
+
       const allowed = new Set(['image/png', 'image/jpeg', 'image/webp']);
       if (!allowed.has(file.type)) {
         setErrorMsg('Unsupported file format. Please upload a PNG, JPG, or WEBP image.');
@@ -165,14 +424,16 @@ export function ExtractorWorkspace({
       };
       reader.readAsDataURL(file);
     },
-    [runImageExtraction],
+    [abortActiveRequest, runImageExtraction],
   );
 
   const handleLoadSampleImage = async (presetId: string) => {
     const preset = SAMPLE_IMAGE_PRESETS.find((item) => item.id === presetId);
     if (!preset) return;
 
+    abortActiveRequest();
     setErrorMsg(null);
+    setResult(null);
     setLoading(true);
     setLoadingLabel(`Loading ${preset.label} specimen...`);
 
@@ -223,11 +484,30 @@ export function ExtractorWorkspace({
     void runUrlExtraction(urlValue);
   };
 
+  const handleChooseAnotherImage = () => {
+    abortActiveRequest();
+    setLoading(false);
+    setLoadingLabel('');
+    setErrorMsg(null);
+    setResult(null);
+    setLoadedImage(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
+    }
+  };
+
   const handleReset = () => {
+    abortActiveRequest();
+    setLoading(false);
+    setLoadingLabel('');
     setResult(null);
     setErrorMsg(null);
     if (mode === 'image') {
       setLoadedImage(null);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     }
   };
 
@@ -372,6 +652,7 @@ export function ExtractorWorkspace({
                 className="sr-only"
                 onChange={(e) => {
                   const file = e.target.files?.[0];
+                  e.target.value = '';
                   if (file) processImageFile(file);
                 }}
               />
@@ -397,16 +678,14 @@ export function ExtractorWorkspace({
                     <div className="mt-4 flex flex-wrap items-center gap-2.5">
                       <button
                         type="button"
-                        disabled={loading}
                         onClick={() => void runImageExtraction(loadedImage)}
-                        className="px-4 py-2 text-xs font-semibold text-white bg-[#15803D] hover:bg-[#166534] disabled:opacity-60 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+                        className="px-4 py-2 text-xs font-semibold text-white bg-[#15803D] hover:bg-[#166534] rounded-lg transition-colors cursor-pointer whitespace-nowrap"
                       >
-                        {loading ? 'Analyzing...' : 'Re-run Font Match'}
+                        Re-run Font Match
                       </button>
                       <button
                         type="button"
-                        disabled={loading}
-                        onClick={() => fileInputRef.current?.click()}
+                        onClick={handleChooseAnotherImage}
                         className="px-4 py-2 text-xs font-medium text-[#111318] bg-white border border-[#D4D8E2] hover:bg-slate-50 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
                       >
                         Choose Another Image
@@ -486,7 +765,33 @@ export function ExtractorWorkspace({
         )}
 
         {/* Loading State */}
-        {loading && (
+        {loading && isImageRequestActive && !result && !errorMsg && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mt-6 p-4 rounded-xl bg-[#FAFBFD] border border-[#DCE0E8] space-y-3"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-sm">
+              <div className="flex items-center gap-2.5 text-[#111318] font-medium">
+                <Loader2 className="w-4 h-4 text-[#15803D] animate-spin shrink-0" />
+                <span>Analyzing font geometry...</span>
+              </div>
+              <span className="font-mono text-xs text-[#4E5666] tabular-nums">
+                {elapsedSeconds}s / 50s max (up to ~50s)
+              </span>
+            </div>
+            <div className="w-full h-1.5 bg-[#E6E9F0] rounded-full overflow-hidden">
+              <div
+                className="h-full bg-[#15803D] rounded-full transition-[width] duration-300 ease-out"
+                style={{
+                  width: `${Math.min(100, Math.max(4, (elapsedSeconds / 50) * 100))}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        {loading && !isImageRequestActive && (
           <div
             role="status"
             aria-live="polite"
